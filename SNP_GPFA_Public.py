@@ -85,11 +85,11 @@ def black_box_variational_inference(logprob, N, N_trs, num_samples, dim_sig,dim_
       """Provides a stochastic estimate of the variational lower bound."""
       mean, log_std, loadings, C, len_sc_sig, len_sc_noise  = unpack_params(params) 
       cdiag_sig = gpf.mkcovs.mkcovdiag_ASD_wellcond(len_sc_sig+0, np.ones(np.size(len_sc_sig)), nxcirc, wwnrm = wwnrm, addition = 1e-7).T #generate cdiag based on len_sc param
-      all_cdiag_sig = np.reshape(cdiag_sig.T,latlength*dim_sig,-1)
+      all_cdiag_sig = np.reshape(cdiag_sig.T,[latlength*dim_sig,-1])
 
 
       cdiag_noise = gpf.mkcovs.mkcovdiag_ASD_wellcond(len_sc_noise+0, np.ones(np.size(len_sc_noise)), nxcirc, wwnrm = wwnrm, addition = 1e-7).T
-      all_cdiag_noise = np.reshape(cdiag_noise.T,latlength*dim_noise,-1) #same cdiag for all trials for noise....i don't vary the length scale per trial.
+      all_cdiag_noise = np.reshape(cdiag_noise.T,[latlength*dim_noise,-1]) #same cdiag for all trials for noise....i don't vary the length scale per trial.
 
       samples = rs.randn(num_samples, N) * np.exp(log_std) + mean #Generate samples using reparam trick
 
@@ -191,12 +191,12 @@ def calc_log_prior(x_samps_sig,x_samps_noise, N_trs, dim_sig, dim_noise, N_four,
 
   for i in np.arange(dim_sig):
     x_samp = np.reshape(x_samps_sig[:,i,:],[numsamps,N_four])
-    total_prior = total_prior -(1/2)*(np.sum(np.square(x_samp)/cdiag_sig[i*N_four:(i+1)*N_four],axis=1)+ np.sum(np.log(2*np.pi*cdiag_sig[i*N_four:(i+1)*N_four])))  
+    total_prior = total_prior -(1/2)*(np.sum(np.square(x_samp).T/cdiag_sig[i*N_four:(i+1)*N_four],axis=0)+ np.sum(np.log(2*np.pi*cdiag_sig[i*N_four:(i+1)*N_four])))  
 
   for j in np.arange(N_trs):
     for k in np.arange(dim_noise):
       x_samp = np.reshape(x_samps_noise[:,j,k,:],[numsamps,N_four])
-      total_prior = total_prior -(1/2)*(np.sum(np.square(x_samp)/cdiag_noise[k*N_four:(k+1)*N_four],axis=1)+ np.sum(np.log(2*np.pi*cdiag_noise[k*N_four:(k+1)*N_four])))#only k dims for noise, this will repeat the same cdiag section j times (once per trial)  
+      total_prior = total_prior -(1/2)*(np.sum(np.square(x_samp).T/cdiag_noise[k*N_four:(k+1)*N_four],axis=0)+ np.sum(np.log(2*np.pi*cdiag_noise[k*N_four:(k+1)*N_four])))#only k dims for noise, this will repeat the same cdiag section j times (once per trial)  
 
 
   return total_prior
@@ -229,7 +229,7 @@ def optimize(y, num_var_params, n_neurs, dim_sig,  dim_noise, N_four, N_trs):
   init_params = np.concatenate([init_mean, init_log_std,init_loadings, init_C, init_len_sc])
 
   #set optimization params -- annealing BBVI here.
-  num_samples = [10,10,10] #number of samples for BBVI (usually don't need too many more than 10 or 15)
+  num_samples = [15,15,15] #number of samples for BBVI (usually don't need too many more than 10 or 15)
   num_iters = [300,300,100] #number of iterations (increase if convergence is not good)
   step_size = [.05,.01,.001] #step size
 
@@ -249,13 +249,157 @@ def optimize(y, num_var_params, n_neurs, dim_sig,  dim_noise, N_four, N_trs):
 
 
 
+def padded_data(n_trials, n_neurons, max_len, spikes_n):
+    '''
+    Zero pads the raw spike data to be centre aligned and fixed length
+    '''
+    p_spikes_n = []
+    for trial_i in range(n_trials):
+        padded_s = np.zeros((n_neurons, max_len))
+        if spikes_n[trial_i][1].size != max_len:
+            diff = max_len - spikes_n[trial_i][1].size
+            left_pad = math.ceil(diff/2)
+            right_pad = math.floor(diff/2)
+            for neuron_i in range(n_neurons):
+                padded_s[neuron_i,:] = np.pad(spikes_n[trial_i][neuron_i], (left_pad, right_pad))
+            p_spikes_n.append(padded_s)
+        else:
+            p_spikes_n.append(spikes_n[trial_i])
+    
+    return(p_spikes_n)
+
+def stretched_data(n_trials, n_neurons, max_len, spikes_n):
+    '''
+    Stretches the raw spike data to be fixed length
+    '''
+    s_spikes_n = []
+    for neuron_i in range(n_neurons):
+        s_spike = np.zeros((n_trials,max_len))
+        for trial_i in range(n_trials):
+            factor = max_len/spikes_n[trial_i][neuron_i].size
+            s_sig = librosa.core.resample(spikes_n[trial_i][neuron_i].astype(float), orig_sr=1, target_sr=1*factor)
+            if s_sig.size != max_len:
+                s_sig = s_sig[:-1].copy()
+            s_spike[trial_i,:] = s_sig
+        s_spikes_n.append(np.clip(np.rint(s_spike), 0, 100))
+        
+    return(s_spikes_n)
+
+def pos_based_data(n_trials, n_neurons, max_len, spikes_n):
+    '''
+    Transforms the raw spike data to be based on position instead of time
+    
+    es_spikes_n can be used for the stretched down data to improve computation time
+    but with slightly less accurate spike trains
+    '''
+    e_spikes_n = []    
+    for neuron_i in range(n_neurons):
+        e_spikes = np.zeros((n_trials, max_len*2))
+        for trial_i in range(n_trials):
+            even_spikes = traces.TimeSeries()
+            for i in range(position_n[trial_i].size):
+                even_spikes[position_n[trial_i][i]] = spikes_n[trial_i][neuron_i,i]
+            sample_size = 160/(max_len*2)
+            even_spikes = even_spikes.sample(sample_size)
+            for i in range(len(even_spikes)):
+                if i>(max_len*2-1):
+                    break
+                e_spikes[trial_i, i] = even_spikes[i][1]
+        e_spikes_n.append(e_spikes)
+        
+    es_spikes_n = []
+    for neuron_i in range(n_neurons):
+        s_spike = np.zeros((n_trials,max_len))
+        for trial_i in range(n_trials):
+            factor = max_len/e_spikes_n[neuron_i][trial_i].size
+            s_sig = librosa.core.resample(e_spikes_n[neuron_i][trial_i].astype(float), orig_sr=1, target_sr=1*factor)
+            if s_sig.size != max_len:
+                s_sig = s_sig[:-1].copy()
+            s_spike[trial_i,:] = s_sig
+        es_spikes_n.append(np.clip(np.rint(s_spike), 0, 100))
+        
+    return(es_spikes_n)
+
+def warped_data(n_trials, n_neurons, max_len, fixed_spikes_n):
+    '''
+    Warps the padded/stretched spike data with shift/linear/piecewise linear warping
+    '''
+    f_spikes = np.dstack(fixed_spikes_n) #when using streched data
+    #f_spikes = np.dstack(fixed_spikes_n).transpose(2,1,0) #when using padded data
+
+    #model = ShiftWarping(smoothness_reg_scale=20.0)
+    model = PiecewiseWarping(n_knots=0, warp_reg_scale=3.6e-6, smoothness_reg_scale=20.0)
+    model.fit(f_spikes, iterations=184, warp_iterations=1001)
+
+    all_neurons = np.arange(0, n_neurons)
+
+    raw_spikes = SpikeData(*np.where(f_spikes), 0, f_spikes.shape[1]).select_neurons(all_neurons)
+    est_align = model.transform(raw_spikes)
+
+    b_spikes = est_align.bin_spikes(est_align.tmax)
+    
+    return(b_spikes)
+
+
 
 
 print('Loading data ...... ')
-pth = 'Trimmed_data_0_orientation.npz' #Change this line! Specify path to data npz file.
-y_train = np.load(pth)['arr_0'][()]['y_train'] 
+#pth = 'Trimmed_data_0_orientation.npz' #Change this line! Specify path to data npz file.
+#y_train = np.load(pth)['arr_0'][()]['y_train'] 
 #N, nAL_neurons, D = AL_ex.shape
 #tot_ex = np.concatenate([AL_ex, V1_ex], axis = 1).T
+
+
+import math
+import librosa
+import traces
+from affinewarp import PiecewiseWarping, ShiftWarping, SpikeData
+import pickle
+with open('ST263_Day1.pkl', 'rb') as f: #loading the data
+    ST263_Day1 = pickle.load(f)
+    
+oasis = ST263_Day1['oasis']
+position = ST263_Day1['position']
+signals = ST263_Day1['signals']
+spikes = ST263_Day1['spikes']
+time_steps = ST263_Day1['time']
+trial = ST263_Day1['trial']
+
+oasis_n = []
+position_n = []
+signals_n = []
+spikes_n = []
+time_n = []
+
+n_trials = trial[-1]+1
+n_neurons = signals.shape[0]
+
+for trial_i in range(n_trials): #separating the data by trial
+    indeces = [i for i, value in enumerate(trial) if value == trial_i]
+
+    oasis_n.append(oasis[:,indeces[0]:(indeces[-1]+1)])
+    position_n.append(position[indeces[0]:(indeces[-1]+1)])
+    signals_n.append(signals[:,indeces[0]:(indeces[-1]+1)])
+    spikes_n.append(spikes[:,indeces[0]:(indeces[-1]+1)])
+    time_n.append(time_steps[indeces[0]:(indeces[-1]+1)])
+    
+
+max_len = 0
+for trial_i in range(n_trials): #determine the size of the trial of maximal length
+    if signals_n[trial_i][0].size > max_len:
+        max_len = signals_n[trial_i][0].size
+    
+p_data = padded_data(n_trials, n_neurons, max_len, spikes_n)
+s_data = stretched_data(n_trials, n_neurons, max_len, spikes_n)
+pos_data = pos_based_data(n_trials, n_neurons, max_len, spikes_n)
+w_data = warped_data(n_trials, n_neurons, max_len, s_data) #change here between padded or stretched data (p_data or s_data)
+
+#choose here which preprocessing method to follow
+
+#y_train = np.dstack(p_data).transpose(2,0,1)
+#y_train = np.dstack(s_data).transpose(0,2,1)
+#y_train = np.dstack(pos_data).transpose(0,2,1)
+y_train = w_data.transpose(0,2,1)
 
 
 ##################### Inference ######################
@@ -323,66 +467,146 @@ recon_noise_lat_time = lat_mean_noise@Bf[None, :] #number of trials by dim of no
 
 ########### Plotting #############
 #Optimization of ELBO
-# plt.figure(1)
-# plt.plot(times, elbos)
+plt.figure(1)
+plt.plot(times, elbos)
+plt.ylabel('ELBO')
+plt.xlabel('Steps')
 
+clock_cycle = time_n[0][1]-time_n[0][0] #for time-based data
+#clock_cycle = 160/N #for pos-based data
 
 plt.figure(2)
 u, s, v = np.linalg.svd(recon_latent_time)
 pclat = u.T@recon_latent_time
-plt.plot(np.arange(0,511*5,5),pclat.T)
+plt.plot(np.arange(0,N*clock_cycle,clock_cycle),pclat.T)
 plt.ylabel('Signal PCs')
-plt.xlabel('time (ms)')
+plt.xlabel('Time (s)')
+plt.legend(['PC1','PC2','PC3','PC4','PC5'], loc="lower left", ncol = 3, fontsize=12)
 
 
 plt.figure(3)
 u, s, v = np.linalg.svd(recon_noise_lat_time[0,:,:])
 pclat = u.T@recon_noise_lat_time[0,:,:]
-plt.plot(np.arange(0,511*5,5),pclat[0:3].T)
-plt.ylabel('noise PCs')
-plt.xlabel('time (ms)')
-plt.legend(['PC1','PC2','PC3'])
+plt.plot(np.arange(0,N*clock_cycle,clock_cycle),pclat[:4].T)
+plt.ylabel('Noise PCs')
+plt.xlabel('Time (s)')
+plt.legend(['PC1','PC2','PC3','PC4'], fontsize=12)
+#plt.ylim([-1,1])
+
 
 ## one trial
-# u,s,v = np.linalg.svd(W_s[:-1], full_matrices = False) #remove DC offset
-# trial = 0
-# Y_n = W_n.T@recon_noise_lat_time[trial]
-# proj= v.T@v@Y_n
-# proj_noise2sig = np.sum(np.square(proj), axis = 0)
-# orth_noise2sig = np.sum(np.square(Y_n - v.T@v@Y_n), axis = 0)
-# #plt.plot(proj_noise2sig)
-# #plt.plot(orth_noise2sig)
-
-# tot_var = np.sum(np.square(Y_n),axis = 0)
-
-
+"""plt.figure(4)
+u,s,v = np.linalg.svd(W_s[:-1], full_matrices = False) #remove DC offset
+trial = 0
+Y_n = W_n.T@recon_noise_lat_time[trial]
+proj= v.T@v@Y_n
+align_noise2sig = np.sum(np.square(proj), axis = 0)
+orth_noise2sig = np.sum(np.square(Y_n - v.T@v@Y_n), axis = 0)
+tot_var = np.sum(np.square(Y_n),axis = 0)
+plt.plot(np.arange(0,N*clock_cycle,clock_cycle), align_noise2sig)
+plt.plot(np.arange(0,N*clock_cycle,clock_cycle), orth_noise2sig)
+plt.xlabel('time (s)')
+plt.legend(['align','orth'])
+plt.show()
+plt.plot(np.arange(0,N*clock_cycle,clock_cycle), orth_noise2sig-align_noise2sig)
+plt.plot(np.arange(0,N*clock_cycle,clock_cycle), np.clip(orth_noise2sig-align_noise2sig,0,1000))
+plt.xlabel('time (s)')
+plt.show()
+plt.plot(np.arange(0,N*clock_cycle,clock_cycle), align_noise2sig/tot_var)
+plt.plot(np.arange(0,N*clock_cycle,clock_cycle), orth_noise2sig/tot_var)
+plt.xlabel('time (s)')
+plt.legend(['align','orth'])"""
 
 
 ### summing over all trials
+tot_align = 0
+tot_orth = 0
+tot_align_unnorm = 0
+tot_orth_unnorm = 0
+orth_filter = 0
+start_trial = 0
+end_trial = N_trs
 
-tot_proj = 0
-for i in np.arange(N_trs):
+for i in np.arange(start_trial,end_trial):
   u,s,v = np.linalg.svd(W_s[:-1], full_matrices = False)
 
   #Y_s = W.T@recon_lat_time_sixdims
   Y_n = W_n.T@recon_noise_lat_time[i,:,:]
   proj= v.T@v@Y_n
-  proj_noise2sig = np.sum(np.square(proj), axis = 0)
-
-
+  align_noise2sig = np.sum(np.square(proj), axis = 0)
   orth_noise2sig = np.sum(np.square(Y_n - v.T@v@Y_n), axis = 0)
 
+  orth_filter += orth_noise2sig-align_noise2sig
 
   tot_var = np.sum(np.square(Y_n),axis = 0)
-  tot_proj += orth_noise2sig/tot_var
+  tot_align += align_noise2sig/tot_var
+  tot_orth += orth_noise2sig/tot_var
+  tot_align_unnorm += align_noise2sig
+  tot_orth_unnorm += orth_noise2sig
 
-plt.figure(4)
-plt.plot(np.arange(0,511*5,5),tot_proj/N_trs)
-plt.ylabel('Fraction of noise projected orthogonal to signal subspace')
-plt.xlabel('time (ms)')
-
+plt.figure(5)
+plt.plot(np.arange(0,N*clock_cycle,clock_cycle),tot_align/(end_trial-start_trial))
+plt.plot(np.arange(0,N*clock_cycle,clock_cycle),tot_orth/(end_trial-start_trial))
+plt.ylabel('L2 Norm (frac)')
+plt.xlabel('Time (s)')
+plt.legend(['align','orth'], loc="upper right", fontsize=12)
 plt.show()
+plt.plot(np.arange(0,N*clock_cycle,clock_cycle),tot_align_unnorm/(end_trial-start_trial))
+plt.plot(np.arange(0,N*clock_cycle,clock_cycle),tot_orth_unnorm/(end_trial-start_trial))
+plt.ylabel('L2 Norm')
+plt.xlabel('Time (s)')
+plt.legend(['align','orth'], loc="upper right", fontsize=12)
+plt.show()
+plt.plot(np.arange(0,N*clock_cycle,clock_cycle),orth_filter/(end_trial-start_trial))
+plt.plot(np.arange(0,N*clock_cycle,clock_cycle),np.zeros(N))
+plt.ylabel('L2 Norm diff (orth filter)')
+plt.xlabel('Time (s)')
 
 
+### summing over all trials
+start_trial = np.arange(0,N_trs-10,10)
+end_trial = np.arange(10,N_trs,10)
 
+for j in range(len(start_trial)):
+    tot_align = 0
+    tot_orth = 0
+    tot_align_unnorm = 0
+    tot_orth_unnorm = 0
+    orth_filter = 0
+    
+    for i in np.arange(start_trial[j],end_trial[j]):
+        u,s,v = np.linalg.svd(W_s[:-1], full_matrices = False)
+
+        #Y_s = W.T@recon_lat_time_sixdims
+        Y_n = W_n.T@recon_noise_lat_time[i,:,:]
+        proj= v.T@v@Y_n
+        align_noise2sig = np.sum(np.square(proj), axis = 0)
+        orth_noise2sig = np.sum(np.square(Y_n - v.T@v@Y_n), axis = 0)
+
+        orth_filter += orth_noise2sig-align_noise2sig
+
+        tot_var = np.sum(np.square(Y_n),axis = 0)
+        tot_align += align_noise2sig/tot_var
+        tot_orth += orth_noise2sig/tot_var
+        tot_align_unnorm += align_noise2sig
+        tot_orth_unnorm += orth_noise2sig
+
+    plt.figure(6)
+    plt.plot(np.arange(0,N*clock_cycle,clock_cycle),tot_align/(end_trial[j]-start_trial[j]))
+    plt.plot(np.arange(0,N*clock_cycle,clock_cycle),tot_orth/(end_trial[j]-start_trial[j]))
+    plt.ylabel('L2 Norm (frac)')
+    plt.xlabel('Time (s)')
+    plt.legend(['align','orth'], loc="upper right", fontsize=12)
+    plt.show()
+    plt.plot(np.arange(0,N*clock_cycle,clock_cycle),tot_align_unnorm/(end_trial[j]-start_trial[j]))
+    plt.plot(np.arange(0,N*clock_cycle,clock_cycle),tot_orth_unnorm/(end_trial[j]-start_trial[j]))
+    plt.ylabel('L2 Norm')
+    plt.xlabel('Time (s)')
+    plt.legend(['align','orth'], loc="upper right", fontsize=12)
+    plt.show()
+    plt.plot(np.arange(0,N*clock_cycle,clock_cycle),orth_filter/(end_trial[j]-start_trial[j]))
+    plt.plot(np.arange(0,N*clock_cycle,clock_cycle),np.zeros(N))
+    plt.ylabel('L2 Norm diff')
+    plt.xlabel('Time (s)')
+    plt.show()
 
